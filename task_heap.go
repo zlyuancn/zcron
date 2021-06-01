@@ -49,7 +49,7 @@ func (t *TaskHeap) Push(task ITask) {
 
 func (t *TaskHeap) Remove(task ITask) {
 	index := task.getHeapIndex()
-	if t.tasks[index] != task { // 检查
+	if index >= len(t.tasks) || t.tasks[index] != task { // 检查
 		return
 	}
 

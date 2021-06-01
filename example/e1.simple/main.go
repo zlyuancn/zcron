@@ -26,6 +26,7 @@ func main() {
 
 	cron.AddTask(task) // 将任务添加到定时器
 	cron.Start()       // 启动定时器
+	cron.RemoveTask(task.Name())
 
 	<-time.After(5 * time.Second) // 等待5秒后结束
 	cron.Stop()

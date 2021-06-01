@@ -21,22 +21,22 @@ type ITask interface {
 	// 输出
 	String() string
 
-	// 设置启用
-	Enable(enable ...bool)
 	// 获取触发时间
 	TriggerTime() time.Time
 	// 生成下次触发时间, 如果返回了 false 表示没有下一次了, 返回的时间一定>t
 	MakeNextTriggerTime(t time.Time) (time.Time, bool)
 	// 立即触发执行, 阻塞等待执行结束
 	Trigger(callback ErrCallback) *ExecuteInfo
-	// 重置定时, 发生在被定时器添加任务时和重新设为启用时
-	ResetClock()
 
 	// 修改触发器
 	ChangeTrigger(trigger ITrigger)
 	// 修改执行器
 	ChangeExecutor(executor IExecutor)
 
+	// 重置定时, 发生在被定时器添加任务时和重新设为启用时
+	resetClock()
+	// 设置启用
+	setEnable(enable bool)
 	// 设置堆索引
 	setHeapIndex(index int)
 	// 获取堆索引
@@ -119,7 +119,7 @@ func NewTaskOfConfig(name string, config TaskConfig) ITask {
 		executor: config.Executor,
 		handler:  config.Handler,
 	}
-	t.Enable(config.Enable)
+	t.setEnable(config.Enable)
 	return t
 }
 
@@ -202,14 +202,6 @@ func (t *Task) String() string {
 	return text
 }
 
-func (t *Task) Enable(enable ...bool) {
-	if len(enable) == 0 || enable[0] {
-		atomic.StoreInt32(&t.enable, 1)
-		t.ResetClock()
-	} else {
-		atomic.StoreInt32(&t.enable, 0)
-	}
-}
 func (t *Task) TriggerTime() time.Time {
 	t.mx.Lock()
 	tt := t.triggerTime
@@ -217,6 +209,10 @@ func (t *Task) TriggerTime() time.Time {
 	return tt
 }
 func (t *Task) MakeNextTriggerTime(tt time.Time) (time.Time, bool) {
+	if !t.IsEnable() {
+		return tt, false
+	}
+
 	tt, ok := t.trigger.MakeNextTriggerTime(tt)
 	t.mx.Lock()
 	t.triggerTime = tt
@@ -244,12 +240,6 @@ func (t *Task) Trigger(callback ErrCallback) *ExecuteInfo {
 	t.mx.Unlock()
 	return info
 }
-func (t *Task) ResetClock() {
-	t.mx.Lock()
-	trigger := t.trigger
-	t.mx.Unlock()
-	trigger.ResetClock()
-}
 
 // 执行
 func (t *Task) execute(ctx IContext, errCallback ErrCallback) error {
@@ -271,6 +261,19 @@ func (t *Task) ChangeExecutor(executor IExecutor) {
 	t.mx.Unlock()
 }
 
+func (t *Task) resetClock() {
+	t.mx.Lock()
+	trigger := t.trigger
+	t.mx.Unlock()
+	trigger.ResetClock()
+}
+func (t *Task) setEnable(enable bool) {
+	if enable {
+		atomic.StoreInt32(&t.enable, 1)
+	} else {
+		atomic.StoreInt32(&t.enable, 0)
+	}
+}
 func (t *Task) setHeapIndex(index int) {
 	t.heapIndex = index
 }

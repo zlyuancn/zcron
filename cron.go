@@ -34,6 +34,8 @@ type ICron interface {
 	AddTask(task ITask) bool
 	// 移除任务
 	RemoveTask(name string)
+	// 启用任务
+	EnableTask(task ITask, enable bool)
 	// 获取任务名列表, 按名称排序
 	TaskNames() []string
 	// 获取任务列表, 按名称排序
@@ -107,17 +109,11 @@ type Cron struct {
 	successNum uint64
 	failureNum uint64
 
-	pause RunState
-
 	mx sync.Mutex // 锁 tasks, heaps
 }
 
 func (s *Cron) RunState() RunState {
-	state := RunState(atomic.LoadInt32((*int32)(&s.runState)))
-	if state == StartedState && s.isPause() {
-		state = PausedState
-	}
-	return state
+	return RunState(atomic.LoadInt32((*int32)(&s.runState)))
 }
 
 func (s *Cron) CronInfo() *CronInfo {
@@ -148,19 +144,24 @@ func (s *Cron) Start() {
 		return
 	}
 	s.log.Debug("正在启动定时器")
-	atomic.StoreInt32((*int32)(&s.pause), int32(ResumingState))
 
-	s.start()
+	s.resetClock()
+	go s.start()
 
-	atomic.StoreInt32((*int32)(&s.pause), int32(StartedState))
 	atomic.StoreInt32((*int32)(&s.runState), int32(StartedState))
 	s.log.Info("已启动定时器")
 }
 
 func (s *Cron) Stop() {
-	if !atomic.CompareAndSwapInt32((*int32)(&s.runState), int32(StartedState), int32(StoppingState)) {
+	state := atomic.LoadInt32((*int32)(&s.runState))
+	if RunState(state) == StoppingState || RunState(state) == StoppedState {
 		return
 	}
+
+	if !atomic.CompareAndSwapInt32((*int32)(&s.runState), state, int32(StoppingState)) {
+		return
+	}
+
 	s.log.Warn("正在关闭定时器")
 	s.closeChan <- struct{}{}
 	<-s.closeChan
@@ -174,7 +175,7 @@ func (s *Cron) Pause() {
 		return
 	}
 
-	if atomic.CompareAndSwapInt32((*int32)(&s.pause), int32(StartedState), int32(PausedState)) {
+	if atomic.CompareAndSwapInt32((*int32)(&s.runState), int32(StartedState), int32(PausedState)) {
 		s.log.Warn("暂停定时器")
 	}
 }
@@ -184,12 +185,12 @@ func (s *Cron) Resume() {
 		return
 	}
 
-	if atomic.CompareAndSwapInt32((*int32)(&s.pause), int32(PausedState), int32(ResumingState)) {
+	if atomic.CompareAndSwapInt32((*int32)(&s.runState), int32(PausedState), int32(ResumingState)) {
 		s.resetClock()
 
 		// 设为启动状态(恢复完成)
 		// 这里使用cas是为了防止这个时候用户调用了Stop()+Start()后状态被更改
-		if atomic.CompareAndSwapInt32((*int32)(&s.pause), int32(ResumingState), int32(StartedState)) {
+		if atomic.CompareAndSwapInt32((*int32)(&s.runState), int32(ResumingState), int32(StartedState)) {
 			s.log.Info("恢复定时器")
 		}
 	}
@@ -204,15 +205,12 @@ func (s *Cron) AddTask(task ITask) bool {
 
 	s.tasks[task.Name()] = task
 
-	if s.RunState() == StartedState {
-		task.ResetClock()
-		tt, ok := task.MakeNextTriggerTime(time.Now())
-		if !ok { // 它永远不会执行
-			s.mx.Unlock()
-			return true
+	if task.IsEnable() && s.RunState() == StartedState {
+		task.resetClock()
+		_, ok := task.MakeNextTriggerTime(time.Now())
+		if ok {
+			s.pushTaskToHeap(task)
 		}
-		heap := s.getHeapOfTime(tt.Unix())
-		heap.Push(task)
 	}
 
 	s.mx.Unlock()
@@ -232,6 +230,28 @@ func (s *Cron) RemoveTask(name string) {
 	heap := s.getHeapOfTime(task.TriggerTime().Unix())
 	heap.Remove(task)
 
+	s.mx.Unlock()
+}
+
+func (s *Cron) EnableTask(task ITask, enable bool) {
+	s.mx.Lock()
+	rawTask, ok := s.tasks[task.Name()]
+	if !ok || rawTask != task {
+		s.mx.Unlock()
+		return
+	}
+
+	heap := s.getHeapOfTime(task.TriggerTime().Unix())
+	heap.Remove(task)
+
+	task.setEnable(enable)
+	if enable && s.RunState() == StartedState {
+		task.resetClock()
+		_, ok := task.MakeNextTriggerTime(time.Now())
+		if ok {
+			s.pushTaskToHeap(task)
+		}
+	}
 	s.mx.Unlock()
 }
 
@@ -274,34 +294,45 @@ func (s *Cron) GetTask(name string) ITask {
 
 // 开始
 func (s *Cron) start() {
-	s.resetClock()
-
-	go func() {
-		timer := time.NewTicker(time.Second)
-		for {
-			select {
-			case t := <-timer.C:
-				if !s.isPause() {
-					go s.heartBeat(t)
-				}
-			case <-s.closeChan:
-				timer.Stop()
-				s.closeChan <- struct{}{}
-				return
+	timer := time.NewTicker(time.Second)
+	for {
+		select {
+		case t := <-timer.C:
+			if s.isStarted() {
+				go s.heartBeat(t)
 			}
+		case <-s.closeChan:
+			timer.Stop()
+			s.closeChan <- struct{}{}
+			return
 		}
-	}()
+	}
 }
 
-// 是否暂停中
-func (s *Cron) isPause() bool {
-	return atomic.LoadInt32((*int32)(&s.pause)) != int32(StartedState) // 只要不是运行时都是暂停状态
+// 是否已开始
+func (s *Cron) isStarted() bool {
+	return atomic.LoadInt32((*int32)(&s.runState)) == int32(StartedState)
+}
+
+// 构建时间堆
+func (s *Cron) remakeHeaps() {
+	heaps := make([]ITaskHeap, heapsCount)
+	for i := 0; i < heapsCount; i++ {
+		heaps[i] = NewTaskHeap()
+	}
+	s.heaps = heaps
 }
 
 // 根据时间获取任务堆
 func (s *Cron) getHeapOfTime(sec int64) ITaskHeap {
 	bucket := sec & (heapsCount - 1)
 	return s.heaps[bucket]
+}
+
+// 将任务放入任务堆中
+func (s *Cron) pushTaskToHeap(task ITask) {
+	heap := s.getHeapOfTime(task.TriggerTime().Unix())
+	heap.Push(task)
 }
 
 // 心跳
@@ -313,43 +344,37 @@ func (s *Cron) heartBeat(t time.Time) {
 
 	for {
 		if len(heap.Tasks()) == 0 { // 没有任务
-			break
+			return
 		}
 
 		task := heap.Tasks()[0]
 		if task.TriggerTime().After(t) { // 时间未到
-			break
+			return
 		}
 
 		task = heap.Pop()
 		s.triggerTask(task) // 触发
 
 		// 获取下一次触发时间
-		tt, ok := task.MakeNextTriggerTime(t)
-		if !ok {
-			continue
+		_, ok := task.MakeNextTriggerTime(t)
+		if ok {
+			s.pushTaskToHeap(task)
 		}
-
-		// 放到另一个任务堆中
-		nextHeap := s.getHeapOfTime(tt.Unix())
-		nextHeap.Push(task)
 	}
-
 }
 
 // 触发一个任务
 func (s *Cron) triggerTask(t ITask) {
 	if s.gpool == nil {
 		go s.execute(t)
-	} else {
-		add := s.gpool.TryAddJob(func() {
-			s.execute(t)
-		})
-		if !add {
-			if s.log != nil {
-				s.log.Warn("任务生成失败, 因为队列已满", zap.String("name", t.Name()))
-			}
-		}
+		return
+	}
+
+	add := s.gpool.TryAddJob(func() {
+		s.execute(t)
+	})
+	if !add {
+		s.log.Warn("任务生成失败, 因为队列已满", zap.String("name", t.Name()))
 	}
 }
 
@@ -373,44 +398,37 @@ func (s *Cron) execute(task ITask) {
 	}
 }
 
-// 重置定时器, 会重新创建任务堆列表并重新将所有任务加入堆中
+// 重置定时器
+//
+// 会重新创建任务堆列表并重新将所有任务加入堆中.
+// 这里不要做任何耗时操作, 否则可能会错过下一秒的时间导致任务会延迟64秒后执行
 func (s *Cron) resetClock() {
-	heaps := make([]ITaskHeap, heapsCount)
-	for i := 0; i < heapsCount; i++ {
-		heaps[i] = NewTaskHeap()
-	}
-
 	s.mx.Lock()
-	s.heaps = heaps
+	s.remakeHeaps()
 
 	now := time.Now()
 	for _, task := range s.tasks {
-		task.ResetClock()
-		t, ok := task.MakeNextTriggerTime(now)
-		if !ok {
+		if !task.IsEnable() {
 			continue
 		}
 
-		heap := s.getHeapOfTime(t.Unix())
-		heap.Push(task)
+		task.resetClock()
+		_, ok := task.MakeNextTriggerTime(now)
+		if ok {
+			s.pushTaskToHeap(task)
+		}
 	}
 	s.mx.Unlock()
 }
 
 func NewCron(opts ...Option) ICron {
-	heaps := make([]ITaskHeap, heapsCount)
-	for i := 0; i < heapsCount; i++ {
-		heaps[i] = NewTaskHeap()
-	}
-
 	s := &Cron{
 		Options:   newOptions(),
 		tasks:     make(map[string]ITask),
-		heaps:     heaps,
 		runState:  StoppedState,
 		closeChan: make(chan struct{}),
-		pause:     0,
 	}
+	s.remakeHeaps()
 
 	for _, o := range opts {
 		o(s.Options)
