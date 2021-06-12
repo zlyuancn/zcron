@@ -28,8 +28,6 @@ type ITask interface {
 	// 立即触发执行, 阻塞等待执行结束
 	Trigger(callback ErrCallback) *ExecuteInfo
 
-	// 修改触发器
-	ChangeTrigger(trigger ITrigger)
 	// 修改执行器
 	ChangeExecutor(executor IExecutor)
 
@@ -249,12 +247,6 @@ func (t *Task) execute(ctx IContext, errCallback ErrCallback) error {
 	return executor.Do(ctx, errCallback)
 }
 
-func (t *Task) ChangeTrigger(trigger ITrigger) {
-	t.mx.Lock()
-	trigger.ResetClock()
-	t.trigger = trigger
-	t.mx.Unlock()
-}
 func (t *Task) ChangeExecutor(executor IExecutor) {
 	t.mx.Lock()
 	t.executor = executor
